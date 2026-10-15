@@ -139,7 +139,9 @@ def match_line_item(item, by_code, descriptions, tier_label="Tier I (X City)", a
 
 
 def flag_duplicates(matched_items):
-    """Mark items sharing the same matched_code as potential duplicate billing."""
+    """Mark items sharing the same matched_code as potential duplicate billing.
+    (Simple label only. The app itself now uses bundles.apply_billing_rules, which also
+    understands packages that already include other tests and decides what is counted.)"""
     seen = {}
     for it in matched_items:
         c = it.get('matched_code')
@@ -156,11 +158,24 @@ def flag_duplicates(matched_items):
 
 
 def process_claim(line_items, master_json_path, tier_label="Tier I (X City)", accreditation="NABH"):
+    """Whole-claim check without the UI: match every item, then apply the billing rules so a test
+    that is already included in a package billed on the same claim (e.g. Hb inside a CBC), or
+    a repeated diagnostic test, is not paid twice. Each returned item carries 'rule_status',
+    'rule_note' and 'counted_amount'; the totals use 'counted_amount'."""
+    from bundles import apply_billing_rules  # local import: bundles has no dependency on this module
+
     _, by_code, descriptions = load_master(master_json_path)
     matched = [match_line_item(it, by_code, descriptions, tier_label, accreditation) for it in line_items]
-    matched = flag_duplicates(matched)
+    ruled = apply_billing_rules(
+        [{'code': m.get('matched_code'), 'claimed_amount': m.get('claimed_amount') or 0,
+          'admissible_amount': m.get('admissible_amount')} for m in matched],
+        by_code,
+    )
+    for m, r in zip(matched, ruled):
+        m.update({'rule_status': r['rule_status'], 'rule_note': r['rule_note'],
+                  'counted_amount': r['counted_amount'], 'covered_by': r['covered_by']})
     total_claimed = sum(it.get('claimed_amount') or 0 for it in matched)
-    total_admissible = sum(it.get('admissible_amount') or 0 for it in matched if it.get('admissible_amount') is not None)
+    total_admissible = sum(it['counted_amount'] for it in matched if it['counted_amount'] is not None)
     return {
         'items': matched,
         'total_claimed': total_claimed,

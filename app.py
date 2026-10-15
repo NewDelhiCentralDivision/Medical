@@ -14,12 +14,17 @@ import io
 import json
 import base64
 import datetime
+import tempfile
 
 import streamlit as st
 import pandas as pd
 
-from matcher import load_master, match_line_item, flag_duplicates, get_rate, extract_cghs_code, TIER_KEYS
-from letter_templates import build_sanction_memo, build_ns_checklist
+from matcher import match_line_item, get_rate, extract_cghs_code, TIER_KEYS
+from letter_templates import build_sanction_memo, build_ns_checklist, DEFAULT_OFFICE
+from bundles import (
+    apply_billing_rules, summarise, validate_rules, OVERRIDE_CHOICES, OVERRIDE_AUTO,
+    COUNTED, INCLUDED, REPEAT, FORCED_EXCLUDE, UNMATCHED,
+)
 from num2words_inr import rupees_in_words
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
@@ -36,6 +41,32 @@ TIER2_CITIES = [
 ]
 
 st.set_page_config(page_title="CGHS Claim Checker", page_icon="🩺", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Office / division details (edited in step 4, saved in session state so the page
+# header and the generated documents always agree). Every field has a key
+# "office_<field>"; copy_to is kept as one-line-per-entry text.
+# ---------------------------------------------------------------------------
+def _office_default_text(field):
+    v = DEFAULT_OFFICE[field]
+    return "\n".join(v) if isinstance(v, list) else v
+
+for _f in DEFAULT_OFFICE:
+    st.session_state.setdefault(f"office_{_f}", _office_default_text(_f))
+
+
+def current_office_profile():
+    """The office settings as currently typed into step 4."""
+    prof = {f: st.session_state.get(f"office_{f}", _office_default_text(f)) for f in DEFAULT_OFFICE}
+    prof["copy_to"] = [ln.strip() for ln in str(prof["copy_to"]).splitlines() if ln.strip()]
+    return prof
+
+
+def fiscal_year_label(today=None):
+    """Indian financial year, April-March: 15 Oct 2026 -> '2026-27', 10 Feb 2027 -> '2026-27'."""
+    today = today or datetime.date.today()
+    start = today.year if today.month >= 4 else today.year - 1
+    return f"{start}-{str(start + 1)[-2:]}"
 
 # ---------------------------------------------------------------------------
 # Sidebar: API key + rate list + city/tier
@@ -66,6 +97,38 @@ def _get_secret(name):
 api_key = ""
 model_name = ""
 
+# Model lists for the dropdowns. IDs are the exact API model names. The "Other" entry
+# at the end of every list lets you type a name that isn't listed yet, so a new
+# release never needs a code change.
+CLAUDE_MODELS = {
+    "claude-sonnet-5-5": "claude-sonnet-5-5 - balanced (recommended)",
+    "claude-haiku-5-5": "claude-haiku-5-5 - fastest / cheapest",
+    "claude-opus-5-5": "claude-opus-5-5 - stronger",
+    "claude-fable-5-1": "claude-fable-5-1 - top tier",
+}
+GEMINI_MODELS = {
+    "gemini-3.8-flash": "gemini-3.8-flash - fast (recommended)",
+    "gemini-4-argon": "gemini-4-argon - newest, most capable (Oct 2026)",
+    "gemini-3.6-flash": "gemini-3.6-flash",
+    "gemini-3.5-flash-lite": "gemini-3.5-flash-lite - cheapest",
+    "gemini-3.1-pro-preview": "gemini-3.1-pro-preview (preview)",
+    "gemini-flash-latest": "gemini-flash-latest - rolling alias",
+}
+OTHER_MODEL = "Other (type a model name)..."
+
+
+def model_picker(label, models, default, key, help_text):
+    """Sidebar dropdown of known model IDs, with an 'Other' escape hatch for anything newer."""
+    options = list(models) + [OTHER_MODEL]
+    choice = st.sidebar.selectbox(
+        label, options, index=options.index(default), key=key, help=help_text,
+        format_func=lambda m: models.get(m, m),
+    )
+    if choice == OTHER_MODEL:
+        return st.sidebar.text_input("Model name", value="", key=f"{key}_custom").strip()
+    return choice
+
+
 if provider == "Manual entry only - no OCR, no key needed":
     st.sidebar.caption(
         "No documents get read automatically. Skip straight to section 2 below and type in the "
@@ -89,9 +152,11 @@ elif provider == "Anthropic (Claude)":
         help="Get one at console.anthropic.com. Pre-filled automatically if set in secrets.toml or as an environment variable, so you shouldn't need to type it each time.",
         value=default_key,
     )
-    model_name = st.sidebar.text_input("Model", value="claude-sonnet-5",
-                                        help="Current model as of mid-2026. Anthropic's docs.claude.com "
-                                             "has the up to date list if this ever changes.")
+    model_name = model_picker(
+        "Model", CLAUDE_MODELS, "claude-sonnet-5-5", key="claude_model",
+        help_text="claude-sonnet-5-5 is a good balance of accuracy and cost for reading scanned bills. "
+                  "Pick 'Other' to type any model name; docs.claude.com has the up to date list."
+    )
 else:
     default_key = _get_secret("GEMINI_API_KEY") or _get_secret("GOOGLE_API_KEY")
     api_key = st.sidebar.text_input(
@@ -100,14 +165,14 @@ else:
         help="Get one free at aistudio.google.com/apikey - use the AI Studio key, not a Google Cloud Console key. Pre-filled automatically if set in secrets.toml or as an environment variable.",
         value=default_key,
     )
-    model_name = st.sidebar.text_input(
-        "Model",
-        value="gemini-flash-latest",
-        help="Google retires specific model versions frequently (e.g. gemini-2.5-flash was restricted to "
-             "existing users only in mid-2026). 'gemini-flash-latest' is a rolling alias Google keeps "
-             "pointed at their current recommended fast model, so it should keep working without you "
-             "needing to update this field. If it ever 404s, check "
-             "https://ai.google.dev/gemini-api/docs/models for the current model name."
+    model_name = model_picker(
+        "Model", GEMINI_MODELS, "gemini-3.8-flash", key="gemini_model",
+        help_text="List checked against Google's model pages on 15 Oct 2026. gemini-3.8-flash is the "
+                  "recommended fast model for new projects; gemini-4-argon is the newest and most capable "
+                  "(released 13 Oct 2026); gemini-3.5-flash-lite is the cheapest. 'gemini-flash-latest' is a "
+                  "rolling alias Google keeps pointed at its current fast model. Google retires models "
+                  "regularly - if one ever 404s, pick another here, or choose 'Other' and type the name "
+                  "from https://ai.google.dev/gemini-api/docs/models"
     )
 
 # Strip whitespace and stray quote characters - a very common cause of "API key not valid"
@@ -124,6 +189,8 @@ if provider in ("Anthropic (Claude)", "Google (Gemini)") and not api_key:
 if provider in ("Anthropic (Claude)", "Google (Gemini)") and api_key:
     if st.sidebar.button("✅ Test this key"):
         try:
+            if not model_name:
+                raise ValueError("choose a model first (or type a model name under 'Other')")
             if provider == "Anthropic (Claude)":
                 import anthropic
                 client = anthropic.Anthropic(api_key=api_key)
@@ -222,6 +289,14 @@ uploaded_bytes = custom_master.read() if custom_master else None
 uploaded_name = custom_master.name if custom_master else None
 MASTER_DATA, BY_CODE, DESCRIPTIONS = get_master(uploaded_bytes, uploaded_name)
 st.sidebar.success(f"{len(MASTER_DATA)} CGHS codes loaded (all 3 tiers)")
+_rule_problems = validate_rules(BY_CODE)
+if _rule_problems:
+    # Only happens with a replacement rate list that renumbers or drops codes the
+    # package rules rely on - the rules for those codes then can't be trusted.
+    st.sidebar.warning(
+        f"{len(_rule_problems)} package rule(s) refer to codes missing from this rate list, so the "
+        "'already included in package' check may miss overlaps. First one: " + _rule_problems[0]
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("City / Tier")
@@ -247,7 +322,9 @@ if tier_label != suggested:
     st.sidebar.caption(f"Note: '{city_input}' would normally suggest {suggested}.")
 
 st.title("🩺 CGHS Claim Checker & Sanction Letter Generator")
-st.caption("New Delhi Central Division — decision-support tool. Every match and amount must be reviewed by the processing officer before a case is sanctioned.")
+_division_name = (st.session_state.get("office_division") or "").strip()
+st.caption(f"{_division_name + ' — ' if _division_name else ''}decision-support tool. "
+           "Every match and amount must be reviewed by the processing officer before a case is sanctioned.")
 
 if "extracted" not in st.session_state:
     st.session_state.extracted = None
@@ -422,12 +499,12 @@ if provider in ("Anthropic (Claude)", "Google (Gemini)") and run_ocr:
                     st.error(
                         f"**The model name `{model_name}` isn't available anymore** - {provider.split()[0]} "
                         "retires specific model versions on a rolling basis, sometimes with little notice.\n\n"
-                        + ("Try changing the Model field in the sidebar to `gemini-flash-latest` (a rolling "
-                           "alias that should always point to a current working model), or check "
+                        + ("Pick another model in the sidebar - `gemini-3.8-flash`, or `gemini-flash-latest` "
+                           "(a rolling alias that should always point to a current working model) - or check "
                            "[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models) "
                            "for the current model list."
                            if provider == "Google (Gemini)" else
-                           "Try `claude-sonnet-5` or check "
+                           "Pick another model in the sidebar (e.g. `claude-sonnet-5-5`) or check "
                            "[docs.claude.com](https://docs.claude.com) for the current model list.")
                         + f"\n\nRaw error: `{err_text}`"
                     )
@@ -477,6 +554,25 @@ with col6:
 # ---------------------------------------------------------------------------
 st.header("3. Item-wise CGHS rate check")
 
+
+def _num(x):
+    """Cell value -> a clean number (blank / NaN -> 0; 300.0 -> 300)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0
+    if pd.isna(v):
+        return 0
+    return int(v) if v == int(v) else round(v, 2)
+
+
+def _txt(x):
+    """Cell value -> stripped text (None / NaN -> '')."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    return str(x).strip()
+
+
 items_raw = st.session_state.line_items or []
 if not items_raw:
     st.info("No line items extracted yet. Run extraction above, or add rows manually in the table below.")
@@ -485,63 +581,115 @@ if not items_raw:
 st.caption(f"Rate lookup: **{tier_label}**, **{nabh_status}** (change in the sidebar if needed)")
 
 matched = [match_line_item(it, BY_CODE, DESCRIPTIONS, tier_label=tier_label, accreditation=nabh_status) for it in items_raw]
-matched = flag_duplicates(matched)
-
-for it in matched:
-    it['cghs_rate_used'] = it.get('cghs_rate')
 
 df = pd.DataFrame([{
     'Description (as billed)': it.get('description', ''),
-    'Billed code': it.get('code', ''),
+    'Billed code': it.get('code', '') or '',
     'Matched CGHS code': it.get('matched_code') or '',
-    'Matched CGHS description': it.get('matched_description') or '',
     'Claimed (₹)': it.get('claimed_amount') or 0,
-    f'CGHS rate - {tier_label}, {nabh_status} (₹)': it.get('cghs_rate_used'),
-    'Admissible (₹)': it.get('admissible_amount'),
-    'Flag': it.get('flag'),
+    'Treatment': OVERRIDE_AUTO,
+    'Match check': it.get('flag') or '',
 } for it in matched])
 
-st.write("Review every row. If a match looks wrong, correct the **Matched CGHS code** column directly and the rate/flag will update on the next save.")
+st.write(
+    "Review every row. If a match looks wrong, correct the **Matched CGHS code** - the calculation sheet "
+    "underneath updates straight away. A row you type in by hand is matched automatically from its "
+    "description or code. Leave **Treatment** on *Auto* unless you need to overrule the billing rules for one row."
+)
 edited_df = st.data_editor(
     df,
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     column_config={
-        "Flag": st.column_config.TextColumn(disabled=True),
-    }
+        "Match check": st.column_config.TextColumn(
+            disabled=True,
+            help="How confidently this row was matched to a CGHS code when it was first read. "
+                 "The final result for every row is in the calculation sheet below."),
+        "Treatment": st.column_config.SelectboxColumn(
+            options=OVERRIDE_CHOICES, default=OVERRIDE_AUTO, required=True,
+            help="Auto = apply the billing rules. Count = pay this row even if it looks like a repeat or part "
+                 "of a package. Exclude = do not pay this row."),
+        "Claimed (₹)": st.column_config.NumberColumn(min_value=0, format="%.0f"),
+    },
 )
 
-st.caption(
-    "OK = within CGHS rate · OVERCHARGED = claimed above CGHS rate (capped at CGHS rate below) · "
-    "POSSIBLE DUPLICATE = same CGHS code billed more than once, check for double-counted sub-tests · "
-    "NO MATCH = could not find this item in the rate list, verify the code/description manually."
-)
-
-# Re-derive final admissible totals from (possibly edited) table, re-matching any manually corrected codes
-final_items = []
+# Work out the final rows from the (possibly edited) table: re-match anything typed by hand,
+# cap each row at its CGHS rate, then let the billing rules decide what really counts.
+rows_final = []
 for _, row in edited_df.iterrows():
-    code = extract_cghs_code(str(row.get('Matched CGHS code') or ''), valid_codes=BY_CODE)
-    claimed = row.get('Claimed (₹)') or 0
-    if code and code in BY_CODE:
-        rate = get_rate(BY_CODE[code], tier_label, nabh_status)
-        admissible = min(claimed, rate) if rate is not None else None
-        desc = BY_CODE[code]['description']
-    else:
-        rate = None
-        admissible = None
-        desc = row.get('Description (as billed)')
-    final_items.append({
-        'description': row.get('Description (as billed)'),
+    desc_billed = _txt(row.get('Description (as billed)'))
+    billed_code = _txt(row.get('Billed code'))
+    claimed = _num(row.get('Claimed (₹)'))
+    code = extract_cghs_code(_txt(row.get('Matched CGHS code')), valid_codes=BY_CODE)
+    if not code and (desc_billed or billed_code):
+        auto = match_line_item({'description': desc_billed, 'code': billed_code, 'claimed_amount': claimed},
+                               BY_CODE, DESCRIPTIONS, tier_label=tier_label, accreditation=nabh_status)
+        code = auto.get('matched_code')
+    if not (desc_billed or billed_code or code or claimed):
+        continue  # an empty spare row
+    rate = get_rate(BY_CODE[code], tier_label, nabh_status) if code else None
+    rows_final.append({
+        'description': desc_billed,
+        'billed_code': billed_code,
         'code': code,
         'claimed_amount': claimed,
         'cghs_rate': rate,
-        'admissible_amount': admissible,
-        'matched_description': desc,
+        'admissible_amount': (min(claimed, rate) if rate is not None else None),
+        'matched_description': BY_CODE[code]['description'] if code else desc_billed,
+        'override': _txt(row.get('Treatment')) or OVERRIDE_AUTO,
     })
 
-total_claimed = sum(it['claimed_amount'] or 0 for it in final_items)
-total_admissible = sum(it['admissible_amount'] or 0 for it in final_items if it['admissible_amount'] is not None)
-unresolved = [it for it in final_items if it['admissible_amount'] is None]
+final_items = apply_billing_rules(rows_final, BY_CODE)
+
+
+def _result_note(r):
+    note = r['rule_note']
+    if r['cghs_rate'] is not None and r['claimed_amount'] > r['cghs_rate']:
+        capped = f"Billed ₹{r['claimed_amount']:,} is above the CGHS rate ₹{r['cghs_rate']:,} - restricted to the rate."
+        note = f"{note} {capped}".strip()
+    return note
+
+
+sheet = pd.DataFrame([{
+    'Sl.': i + 1,
+    'Particulars': r['matched_description'],
+    'CGHS code': r['code'] or '-',
+    'Claimed (₹)': r['claimed_amount'],
+    'CGHS rate (₹)': r['cghs_rate'],
+    'Counted (₹)': r['counted_amount'],
+    'Result': r['rule_status'],
+    'Note': _result_note(r),
+} for i, r in enumerate(final_items)])
+
+
+def _row_colour(row):
+    status = row['Result']
+    if status in (INCLUDED, REPEAT, FORCED_EXCLUDE):
+        bg = 'rgba(220, 53, 69, 0.18)'       # held back
+    elif status == UNMATCHED or str(status).startswith('REVIEW'):
+        bg = 'rgba(255, 193, 7, 0.22)'       # needs the officer's attention
+    else:
+        bg = ''
+    return [f'background-color: {bg}' if bg else '' for _ in row]
+
+
+st.subheader("Calculation sheet")
+if len(sheet):
+    st.dataframe(sheet.style.apply(_row_colour, axis=1), width="stretch", hide_index=True)
+else:
+    st.caption("Nothing to calculate yet - add at least one billed item above.")
+
+st.caption(
+    "COUNTED = payable (capped at the CGHS rate) · INCLUDED IN PACKAGE = already covered by a package that is also "
+    "billed (e.g. Hb, TLC and Platelets inside a CBC), counted as ₹0 · REPEAT = the same diagnostic code billed twice, "
+    "counted once · REVIEW = counted for now, but please confirm · NO MATCH = not found in the rate list, verify the "
+    "code or description manually."
+)
+
+total_claimed = sum(r['claimed_amount'] for r in final_items)
+total_admissible = sum(r['counted_amount'] for r in final_items if r['counted_amount'] is not None)
+unresolved = [r for r in final_items if r['counted_amount'] is None]
+summary = summarise(final_items)
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Total claimed", f"₹{total_claimed:,.0f}")
@@ -549,8 +697,20 @@ m2.metric("Total admissible (as per CGHS rates)", f"₹{total_admissible:,.0f}")
 diff = total_claimed - total_admissible
 m3.metric("Difference", f"₹{diff:,.0f}", delta=f"-₹{diff:,.0f}" if diff > 0 else None, delta_color="inverse")
 
+if summary['excluded']:
+    st.info(
+        f"🧮 {summary['excluded']} row(s) are already covered by another billed test or package, or are repeats, "
+        f"so they are not paid twice (₹{summary['held_back_amount']:,.0f} held back). The reason is in the **Note** "
+        "column. Disagree? Set that row's **Treatment** to *Count*."
+    )
+if summary['review']:
+    st.warning(
+        f"🔎 {summary['review']} row(s) are marked REVIEW. They are still counted, but please confirm each one - "
+        "set **Treatment** to *Exclude* to drop a row."
+    )
 if unresolved:
-    st.warning(f"{len(unresolved)} row(s) have no matched CGHS code and are excluded from the admissible total above. Resolve these before sanctioning.")
+    st.warning(f"{len(unresolved)} row(s) have no matched CGHS rate and are excluded from the admissible total above. "
+               "Resolve these before sanctioning.")
 
 st.markdown("---")
 
@@ -559,9 +719,92 @@ st.markdown("---")
 # ---------------------------------------------------------------------------
 st.header("4. Generate Sanction Memo & NS/Checklist")
 
+
+def _apply_office_profile(data):
+    """Copy a dict of office settings into the step-4 widgets' session state."""
+    for f in DEFAULT_OFFICE:
+        if f in data:
+            v = data[f]
+            st.session_state[f"office_{f}"] = "\n".join(str(x) for x in v) if isinstance(v, list) else str(v)
+
+
+def _load_office_profile():
+    up = st.session_state.get("office_profile_upload")
+    if up is None:
+        return
+    try:
+        data = json.loads(up.getvalue().decode("utf-8"))
+        if not isinstance(data, dict) or not any(k in DEFAULT_OFFICE for k in data):
+            raise ValueError("this doesn't look like a saved office-details file")
+        _apply_office_profile(data)
+        st.session_state["office_msg"] = ("ok", f"Loaded office details for {data.get('division') or 'the file'}.")
+    except Exception as e:
+        st.session_state["office_msg"] = ("err", f"Couldn't read that file: {e}")
+
+
+def _reset_office_profile():
+    _apply_office_profile(DEFAULT_OFFICE)
+    st.session_state["office_msg"] = ("ok", f"Reset to {DEFAULT_OFFICE['division']} defaults.")
+
+
+office_now = current_office_profile()
+st.caption(f"Documents will be issued for: **{office_now['division'] or '(division name not set)'}**. "
+           "Using this tool for another division? Edit the office details below.")
+
+with st.expander("🏢 Office / division details - edit these to use the tool for another division", expanded=False):
+    st.caption(
+        "Everything here is printed on the Sanction Memo and the NS/Checklist (letterhead, sanction sentence, "
+        "signature block, copy-to list, memo number). The defaults are this division's original wording."
+    )
+    _msg = st.session_state.pop("office_msg", None)
+    if _msg:
+        (st.success if _msg[0] == "ok" else st.error)(_msg[1])
+
+    o1, o2, o3 = st.columns(3)
+    o1.text_input("Department", key="office_dept_name")
+    o2.text_input("Office line (printed above the division name)", key="office_office_line",
+                  help='For example: "O/o The Senior Superintendent of Post Offices,"')
+    o3.text_input("Division / office name", key="office_division",
+                  help="For example: North Division, East Division, West Division ...")
+    o4, o5, o6 = st.columns(3)
+    o4.text_input("Office address", key="office_address",
+                  help="Printed under the division name. Leave blank to leave the line out.")
+    o5.text_input("Place (for 'Dated at ... the')", key="office_place")
+    o6.text_input("City & PIN (sanction sentence and signature block)", key="office_city_pin")
+    o7, o8, o9 = st.columns(3)
+    o7.text_input("Sanctioning authority - signature block", key="office_sanctioning_authority")
+    o8.text_input("Sanctioning authority - in the sanction sentence", key="office_sanctioning_authority_long")
+    o9.text_input("Memo No. prefix", key="office_memo_no_prefix",
+                  help="The financial year is added automatically, e.g. <prefix>/2026-27")
+    st.text_input("Head of Account (HOA)", key="office_hoa",
+                  help="Leave blank to leave the 'expenditure will be met from ...' line out.")
+    st.text_area("Copy-to list - one line per entry (the claimant is always No. 1)", key="office_copy_to", height=110)
+    o10, o11 = st.columns(2)
+    o10.text_input("NS/Checklist - prepared by", key="office_prepared_by")
+    o11.text_input("NS/Checklist - checked / approved by", key="office_checked_by")
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.download_button("💾 Save these details (.json)",
+                           data=json.dumps(current_office_profile(), indent=2, ensure_ascii=False),
+                           file_name="office_details.json", mime="application/json",
+                           help="Keep this file and use 'Load saved details' next time - the app does not "
+                                "remember anything between sessions.")
+    with s2:
+        st.file_uploader("Load saved details", type=["json"], key="office_profile_upload",
+                         on_change=_load_office_profile)
+    with s3:
+        st.button("↩️ Reset to defaults", on_click=_reset_office_profile)
+
+office_now = current_office_profile()
+
+_fy = fiscal_year_label()
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    memo_no = st.text_input("Memo No.", value=f"L-2/NDHO/MR-XXX/{datetime.date.today().year}-{str(datetime.date.today().year+1)[-2:]}")
+    memo_no = st.text_input(
+        "Memo No.",
+        value=f"{office_now['memo_no_prefix']}/{_fy}" if office_now['memo_no_prefix'].strip() else _fy,
+    )
 with col_b:
     memo_date = st.text_input("Memo date", value=datetime.date.today().strftime("%d.%m.%Y"))
 with col_c:
@@ -577,6 +820,38 @@ use_admissible = st.checkbox("Sanction the CGHS-checked admissible amount (recom
 final_amount = total_admissible if use_admissible else total_claimed
 
 st.write(f"**Amount to be sanctioned: ₹{final_amount:,.0f}** ({rupees_in_words(final_amount)})")
+
+if unresolved or summary['review']:
+    st.caption("⚠️ Some rows above still need a decision (REVIEW / NO MATCH). You can generate the documents now, "
+               "but the amounts will change if you resolve them afterwards - generate again if so.")
+
+
+def _remark(r):
+    """Short reason printed in the Remarks column of the Calculation Sheet page."""
+    if r['rule_status'] == INCLUDED:
+        return f"Included in {r.get('covered_by') or 'a package billed'} - not payable separately"
+    if r['rule_status'] == REPEAT:
+        return "Same test billed more than once - counted once"
+    if r['rule_status'] == FORCED_EXCLUDE:
+        return "Not admitted"
+    if r['cghs_rate'] is not None and r['claimed_amount'] > r['cghs_rate']:
+        return f"Restricted to CGHS rate Rs {r['cghs_rate']}/-"
+    return ""
+
+
+def _order_remark():
+    if abs(total_claimed - total_admissible) < 1:
+        return 'in order'
+    reasons = []
+    if any(r['cghs_rate'] is not None and r['claimed_amount'] > r['cghs_rate'] for r in final_items):
+        reasons.append('billed above CGHS rates')
+    if any(r['rule_status'] in (INCLUDED, REPEAT) for r in final_items):
+        reasons.append('tests already included in a package billed / repeated')
+    if any(r['rule_status'] == FORCED_EXCLUDE for r in final_items):
+        reasons.append('not admitted on verification')
+    why = f" - {', '.join(reasons)}" if reasons else ""
+    return f'partially admissible (Rs {total_claimed - total_admissible:,.0f}/- disallowed{why} - see calculation sheet)'
+
 
 if st.button("📄 Generate documents", type="primary", disabled=(not name or not emp_id)):
     case = {
@@ -601,29 +876,38 @@ if st.button("📄 Generate documents", type="primary", disabled=(not name or no
         'total_admissible': int(total_admissible),
         'total_claimed': int(total_claimed),
         'calc_sheet_sl_no': calc_sheet_sl_no,
-        'order_remark': 'in order' if abs(total_claimed - total_admissible) < 1 else
-                         f'partially admissible (Rs {total_claimed - total_admissible:,.0f}/- in excess of CGHS rates has been disallowed - see calculation sheet)',
+        'order_remark': _order_remark(),
         'recommended': 'Yes',
+        'office_profile': office_now,
     }
     ns_items = [{
         'sl_no': i + 1,
-        'particulars': it['matched_description'] or it['description'],
-        'code': it['code'],
-        'claimed': it['claimed_amount'],
-        'admissible': it['admissible_amount'] if it['admissible_amount'] is not None else 'MANUAL REVIEW',
-    } for i, it in enumerate(final_items)]
+        'particulars': r['matched_description'] or r['description'],
+        'code': r['code'],
+        'claimed': r['claimed_amount'],
+        'admissible': r['counted_amount'] if r['counted_amount'] is not None else 'MANUAL REVIEW',
+        'remark': _remark(r),
+    } for i, r in enumerate(final_items)]
 
-    os.makedirs('/tmp/cghs_out', exist_ok=True)
-    sanction_path = '/tmp/cghs_out/Sanction_Memo.docx'
-    ns_path = '/tmp/cghs_out/NS_Checklist.docx'
+    out_dir = os.path.join(tempfile.gettempdir(), 'cghs_out')
+    os.makedirs(out_dir, exist_ok=True)
+    sanction_path = os.path.join(out_dir, 'Sanction_Memo.docx')
+    ns_path = os.path.join(out_dir, 'NS_Checklist.docx')
     build_sanction_memo(case, sanction_path)
     build_ns_checklist(case, ns_items, ns_path)
 
-    st.success("Documents generated.")
+    # Keep the finished files in the session so both download buttons stay on screen
+    # (clicking one download button reruns the page, which would otherwise make the other vanish).
+    with open(sanction_path, 'rb') as f1, open(ns_path, 'rb') as f2:
+        st.session_state.generated_docs = {'memo': f1.read(), 'ns': f2.read(), 'emp_id': emp_id, 'name': name}
+
+docs = st.session_state.get('generated_docs')
+if docs:
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(docs['emp_id']))
+    st.success(f"Documents generated for {docs['name']} ({docs['emp_id']}).")
+    st.caption("These files don't update by themselves - click **Generate documents** again after changing anything above.")
     dl1, dl2 = st.columns(2)
     with dl1:
-        with open(sanction_path, 'rb') as f:
-            st.download_button("⬇️ Download Sanction Memo (.docx)", f, file_name=f"Sanction_Memo_{emp_id}.docx")
+        st.download_button("⬇️ Download Sanction Memo (.docx)", docs['memo'], file_name=f"Sanction_Memo_{safe_id}.docx")
     with dl2:
-        with open(ns_path, 'rb') as f:
-            st.download_button("⬇️ Download NS/Checklist (.docx)", f, file_name=f"NS_Checklist_{emp_id}.docx")
+        st.download_button("⬇️ Download NS/Checklist (.docx)", docs['ns'], file_name=f"NS_Checklist_{safe_id}.docx")

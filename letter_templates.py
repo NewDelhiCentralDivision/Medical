@@ -4,7 +4,11 @@ Generates the two output documents used in this division's workflow:
   2. NS / Checklist note  (matches "NS_CL_Copy" sample format exactly)
 
 Only the claimant-specific fields change between cases; the surrounding
-text is fixed, matching the division's existing wording.
+text is fixed, matching the division's existing wording - except for the
+office/division details (name, address, signatory titles, head of account,
+copy-to list ...), which come from an editable "office profile" so that any
+division (North / East / West / ...) can use the same tool. DEFAULT_OFFICE
+below reproduces this division's original wording exactly.
 """
 from docx import Document
 from docx.shared import Pt, Inches, Cm
@@ -14,6 +18,46 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from num2words_inr import rupees_in_words, number_to_words_inr
 import datetime
+
+# Everything below is editable in the app (step 4) and can be saved/loaded as JSON.
+DEFAULT_OFFICE = {
+    "dept_name": "Department of Posts",
+    "office_line": "O/o The Senior Superintendent of Post Offices,",
+    "division": "New Delhi Central Division",
+    "address": "Meghdoot Bhawan, New Delhi -110001",
+    "place": "New Delhi",                      # "Dated at <place> the ..."
+    "city_pin": "New Delhi 110001",            # used in the sanction sentence and signature block
+    "sanctioning_authority_long": "The Sr. Superintendent of Post Offices",   # sentence form
+    "sanctioning_authority": "Sr. Supdt. of Post Offices",                   # signature block
+    "hoa": "GL 3201027306-MR HOA (3201-02-101-01-01-06-MR)",
+    "memo_no_prefix": "L-2/NDHO/MR-XXX",
+    # Copy-to list: the claimant is always item 1; these follow as 2, 3, 4 ...
+    "copy_to": [
+        "Director, NDHO for information and making payment to the claimant.",
+        "G M Finance Postal Accounts, Delhi 110054.",
+        "O/c",
+    ],
+    # NS / Checklist signature line
+    "prepared_by": "Postal Assistant",
+    "checked_by": "DySP/ IP(D)/IP (PG)",
+}
+
+
+def resolve_office(case):
+    """Office settings for this case: the defaults, overridden by case['office_profile'].
+    Blank values are respected (a blank address simply drops that line); keys that
+    are missing fall back to the default."""
+    office = dict(DEFAULT_OFFICE)
+    office.update({k: v for k, v in (case.get('office_profile') or {}).items() if k in DEFAULT_OFFICE and v is not None})
+    if case.get('ssp_division'):          # older callers passed the division on its own
+        office['division'] = case['ssp_division']
+    if case.get('hoa'):                   # ... and the head of account
+        office['hoa'] = case['hoa']
+    return office
+
+
+def _clean_lines(lines):
+    return [str(x).strip() for x in (lines or []) if str(x).strip()]
 
 
 def _set_cell_border(cell):
@@ -59,26 +103,35 @@ def build_sanction_memo(case, out_path):
       ssp_division (default 'New Delhi Central Division')
     """
     amount_words = case.get('amount_words') or (number_to_words_inr(case['amount']) + ' Only')
+    office = resolve_office(case)
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Calibri'
     style.font.size = Pt(11)
 
-    _add_para(doc, 'Department of Posts', size=13, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0)
-    _add_para(doc, f"O/o The Senior Superintendent of Post Offices,", size=11, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0)
-    _add_para(doc, f"{case.get('ssp_division','New Delhi Central Division')}", size=11, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0)
-    _add_para(doc, "Meghdoot Bhawan, New Delhi -110001", size=11, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=14)
+    # Letterhead: any line left blank in the office profile is simply left out.
+    head_lines = [
+        (office['dept_name'], 13, True, 0),
+        (office['office_line'], 11, False, 0),
+        (office['division'], 11, True, 0),
+        (office['address'], 11, False, 14),
+    ]
+    head_lines = [h for h in head_lines if h[0] and h[0].strip()]
+    for k, (text, size, bold, after) in enumerate(head_lines):
+        last = (k == len(head_lines) - 1)
+        _add_para(doc, text, size=size, bold=bold, align=WD_ALIGN_PARAGRAPH.CENTER, space_after=(14 if last else 0))
 
     memo_line = doc.add_paragraph()
     memo_line.paragraph_format.space_after = Pt(14)
     r1 = memo_line.add_run(f"Memo No: {case['memo_no']}")
     r1.font.size = Pt(11)
-    r2 = memo_line.add_run(f"\t\t\t\tDated at New Delhi the {case['memo_date']}")
+    r2 = memo_line.add_run(f"\t\t\t\tDated at {office['place']} the {case['memo_date']}")
     r2.font.size = Pt(11)
 
+    authority_where = ", ".join(x for x in (office['division'], office['city_pin']) if x and x.strip())
     body_text = (
-        f"Sanction of The Sr. Superintendent of Post Offices, {case.get('ssp_division','New Delhi Central Division')}, "
-        f"New Delhi 110001 is hereby conveyed for the payment Rs. {case['amount']}/- "
+        f"Sanction of {office['sanctioning_authority_long']}, {authority_where} "
+        f"is hereby conveyed for the payment Rs. {case['amount']}/- "
         f"(Rs. {amount_words}) to {_name_designation_office(case)}, "
         f"Pin – {case['pin']}, Emp. ID –{case['emp_id']} being the expenses incurred by him/her "
         f"for the treatment/test of {case.get('patient_relation','himself/herself')} from {case['hospital']}, "
@@ -86,34 +139,30 @@ def build_sanction_memo(case, out_path):
     )
     _add_para(doc, body_text, size=11, space_after=14)
 
-    hoa_text = (
-        f"The expenditure will be met from the sanction grant under head "
-        f"{case.get('hoa', 'GL 3201027306-MR HOA (3201-02-101-01-01-06-MR)')}."
-    )
-    _add_para(doc, hoa_text, size=11, space_after=28)
+    if office['hoa'] and office['hoa'].strip():
+        hoa_text = (
+            f"The expenditure will be met from the sanction grant under head "
+            f"{office['hoa']}."
+        )
+        _add_para(doc, hoa_text, size=11, space_after=28)
+    else:
+        _add_para(doc, "", size=11, space_after=28)
 
-    sig = doc.add_paragraph()
-    sig.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    sig.paragraph_format.space_after = 0
-    r = sig.add_run("Sr. Supdt. of Post Offices")
-    r.font.size = Pt(11)
-    sig2 = doc.add_paragraph()
-    sig2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    sig2.paragraph_format.space_after = 0
-    r = sig2.add_run(f"{case.get('ssp_division','New Delhi Central Division')}")
-    r.font.size = Pt(11)
-    sig3 = doc.add_paragraph()
-    sig3.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    r = sig3.add_run("New Delhi 110001.")
-    r.font.size = Pt(11)
+    sig_lines = [office['sanctioning_authority'], office['division'],
+                 (office['city_pin'] + '.') if office['city_pin'] and office['city_pin'].strip() else '']
+    sig_lines = [s for s in sig_lines if s and s.strip()]
+    for k, text in enumerate(sig_lines):
+        sig = doc.add_paragraph()
+        sig.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        if k < len(sig_lines) - 1:
+            sig.paragraph_format.space_after = 0
+        r = sig.add_run(text)
+        r.font.size = Pt(11)
 
     _add_para(doc, "Copy for information and necessary action to:", size=11, space_after=4)
-    copy_list = [
-        f"1- {_name_designation_office(case)}, Pin - {case['pin']}",
-        "2- Director, NDHO for information and making payment to the claimant.",
-        "3- G M Finance Postal Accounts, Delhi 110054.",
-        "4. O/c",
-    ]
+    copy_list = [f"1- {_name_designation_office(case)}, Pin - {case['pin']}"]
+    for n, extra in enumerate(_clean_lines(office['copy_to']), start=2):
+        copy_list.append(f"{n}- {extra}")
     for line in copy_list:
         _add_para(doc, line, size=11, space_after=2)
 
@@ -133,6 +182,8 @@ def build_ns_checklist(case, items, out_path):
       from the summary table), matching how this division actually files item-wise workings
       as a separate sheet rather than inline in the main consolidation table.
     """
+    office = resolve_office(case)
+    signoff = f"{office['prepared_by']}\t\t{office['checked_by']}"
     doc = Document()
     style = doc.styles['Normal']
     style.font.name = 'Calibri'
@@ -198,7 +249,7 @@ def build_ns_checklist(case, items, out_path):
 
     sig = doc.add_paragraph()
     sig.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    r = sig.add_run("Postal Assistant\t\tDySP/ IP(D)/IP (PG)")
+    r = sig.add_run(signoff)
     r.font.size = Pt(10.5)
 
     doc.add_paragraph()
@@ -250,7 +301,7 @@ def build_ns_checklist(case, items, out_path):
     doc.add_paragraph()
     sig2 = doc.add_paragraph()
     sig2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    r = sig2.add_run("Postal Assistant\t\tDySP/ IP(D)/IP (PG)")
+    r = sig2.add_run(signoff)
     r.font.size = Pt(10.5)
 
     # --- Calculation Sheet annexure - the item-wise CGHS rate check, referenced
@@ -262,9 +313,14 @@ def build_ns_checklist(case, items, out_path):
         _add_para(doc, "Item-wise CGHS rate verification", size=10.5,
                    align=WD_ALIGN_PARAGRAPH.CENTER, space_after=14)
 
-        ctable2 = doc.add_table(rows=1, cols=5)
+        # A Remarks column appears only when at least one row needs explaining
+        # (e.g. "Included in LB012 - not payable separately").
+        has_remarks = any((it.get('remark') or '').strip() for it in items)
+        ctable2 = doc.add_table(rows=1, cols=6 if has_remarks else 5)
         ctable2.alignment = WD_TABLE_ALIGNMENT.CENTER
         headers2 = ['Sl. No.', 'Particulars', 'CGHS Code', 'Amount claimed', 'Amount admissible']
+        if has_remarks:
+            headers2.append('Remarks')
         hdr2 = ctable2.rows[0].cells
         for i, h in enumerate(headers2):
             hdr2[i].text = h
@@ -282,6 +338,8 @@ def build_ns_checklist(case, items, out_path):
             row[3].text = f"{it.get('claimed', '-')}/-"
             admissible_val = it.get('admissible', '-')
             row[4].text = f"{admissible_val}/-" if admissible_val != 'MANUAL REVIEW' else 'MANUAL REVIEW'
+            if has_remarks:
+                row[5].text = it.get('remark', '') or ''
             for c in row:
                 for p in c.paragraphs:
                     for r in p.runs:
