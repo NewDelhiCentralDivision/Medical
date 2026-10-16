@@ -54,9 +54,9 @@ def test_app_runs_clean_and_does_not_pay_packaged_tests_twice():
     assert list(sheet["Result"]).count("REPEAT - COUNTED ONCE") == 1
 
 
-def test_gemini_dropdown_lists_current_models():
+def test_gemini_dropdown_lists_current_models(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
     at = _app()
-    at.sidebar.selectbox[0].set_value("Google (Gemini)").run()
     picker = [s for s in at.sidebar.selectbox if s.key == "gemini_model"][0]
     assert picker.value == "gemini-3.8-flash"
     shown = " | ".join(picker.options)          # AppTest reports the display labels, which start with the model ID
@@ -65,6 +65,22 @@ def test_gemini_dropdown_lists_current_models():
     assert "gemini-2.0-flash" not in shown                    # shut down by Google
     picker.set_value("Other (type a model name)...").run()
     assert [t for t in at.sidebar.text_input if t.key == "gemini_model_custom"]
+
+
+def test_embedded_key_is_never_asked_for(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-123")
+    at = _app()
+    assert at.sidebar.radio[0].value == "Google (Gemini)"      # AI mode is the default when a key is set up
+    assert not [t for t in at.sidebar.text_input if "key" in (t.label or "").lower()]
+    assert not at.exception
+
+
+def test_ai_option_hidden_when_no_key_configured(monkeypatch):
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    at = _app()
+    assert "Google (Gemini)" not in at.sidebar.radio[0].options
+    assert not at.exception
 
 
 def test_office_details_flow_into_both_documents():

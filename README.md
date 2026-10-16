@@ -31,68 +31,42 @@ before a case is sanctioned. Treat every output as a draft.
 
 ## Setup
 
-The app has four ways to read a claim - pick one in the sidebar:
+### Using the tool (officers)
 
-| Option | Needs a key? | What it does |
+Officers never see or type an API key. In the sidebar they pick **how to read the documents**; if the key has been set up (below), the first choice is **Auto-read with AI (Gemini)** and the only thing to select is the **model** from the dropdown:
+
+| Reading mode | Needs the key? | What it does |
 |---|---|---|
-| **Manual entry only** | No | Skip document upload entirely, type everything into the form yourself |
-| **Local OCR (offline, free)** | No | Runs Tesseract on your own machine, shows raw extracted text to read alongside the original - does **not** auto-fill amounts (tested: it can misread a digit, e.g. turning ₹1,000 into ₹600) |
-| **Anthropic (Claude)** | Yes | Reads the documents and auto-fills every field, including line items |
-| **Google (Gemini)** | Yes | Same as above; Gemini has a free tier |
+| **Auto-read with AI (Gemini)** | Built in (set once by the administrator) | Reads the documents and auto-fills every field, including line items |
+| **Auto-read with AI (Claude)** | Only shown if an `ANTHROPIC_API_KEY` is also set up | Same, with Claude |
+| **Offline OCR - raw text only** | No | Runs Tesseract on your own machine and shows the raw text to read beside the scan - it does **not** auto-fill amounts (it can misread a digit, e.g. ₹1,000 as ₹600) |
+| **Type everything manually** | No | Skip upload and type the details in; the rate check, flagging and letters work exactly the same |
 
-**Choosing a model.** For both cloud options the sidebar has a Model dropdown (and an *Other* entry for typing any model name that is newer than this list). Gemini choices, checked against Google's model pages on 15 Oct 2026: `gemini-3.8-flash` (default, fast), `gemini-4-argon` (newest and most capable, released 13 Oct 2026), `gemini-3.6-flash`, `gemini-3.5-flash-lite` (cheapest), `gemini-3.1-pro-preview` (preview) and `gemini-flash-latest` (a rolling alias). Google retires models regularly; if one ever stops working, pick another or use *Other*. The current list is at [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models). Claude choices: `claude-sonnet-5-5` (default), `claude-haiku-5-5`, `claude-opus-5-5`, `claude-fable-5-1`.
+If no key has been set up, the AI options simply do not appear and the tool still works in the other two modes.
 
-If you don't want to deal with any API key at all, pick **Manual entry only** and just type in the claimant details and each billed item directly - the rate check, flagging, and letter generation work exactly the same regardless of how the data got into the form. **Local OCR** is a middle ground: it saves you re-typing whole documents by hand by giving you the raw text to copy from, without trusting a machine to read money amounts unsupervised.
+**Models.** Gemini choices, checked against Google's model pages on 15 Oct 2026: `gemini-3.8-flash` (default, fast), `gemini-4-argon` (newest and most capable), `gemini-3.6-flash`, `gemini-3.5-flash-lite` (cheapest), `gemini-3.1-pro-preview` (preview) and `gemini-flash-latest` (rolling alias). The dropdown also has an *Other* entry for any newer model name. Google retires models regularly - the current list is at [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models).
 
-If you do want auto-fill and are willing to use a cloud AI model:
+### One-time key setup (administrator)
 
-1. **Get an API key:**
-   - Claude: sign up at [console.anthropic.com](https://console.anthropic.com), create a key.
-   - Gemini: sign up at [aistudio.google.com/apikey](https://aistudio.google.com/apikey), create a free key.
+Get a free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (an AI Studio key, not a Google Cloud Console key), then store it in **one** of these places - it is picked up automatically and never shown to users:
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   You'll also need two system programs installed (not just the Python packages):
-   - **poppler** (for reading PDF pages):
-     - Windows: download poppler binaries, add the `bin` folder to your PATH ([guide](https://github.com/oschwartz10612/poppler-windows/releases))
-     - Mac: `brew install poppler`
-     - Linux: `sudo apt install poppler-utils`
-   - **tesseract** (only needed if you use the Local OCR option):
-     - Windows: install from the [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki), add it to your PATH
-     - Mac: `brew install tesseract`
-     - Linux: `sudo apt install tesseract-ocr`
+- **Streamlit Community Cloud:** app → Settings → Secrets, add `GEMINI_API_KEY = "your-gemini-key"`.
+- **Local / office PC:** copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in the same line.
+- **Environment variable:** set `GEMINI_API_KEY`.
 
-3. **Save your key so you don't have to retype it every time you run the app locally.** Create a file at `.streamlit/secrets.toml` (a hidden folder, right next to `app.py` - copy `.streamlit/secrets.toml.example` and rename it) with one of:
-   ```toml
-   ANTHROPIC_API_KEY = "sk-ant-..."
-   ```
-   or
-   ```toml
-   GEMINI_API_KEY = "your-gemini-key"
-   ```
-   The app checks this file automatically and pre-fills the sidebar field. (This file is already in `.gitignore` so it won't accidentally get pushed to GitHub.) If you skip this step, you can still just paste the key into the sidebar each session — it's never saved anywhere by the app itself.
+> **Why the key is not written into `app.py`:** this GitHub repository is public. Google scans public repositories and automatically disables any key it finds, and anyone could also copy the key and spend your quota. Secrets keep the key inside the tool but out of the code. `.streamlit/secrets.toml` is in `.gitignore` so it cannot be pushed by mistake.
 
-4. **Run it:**
-   ```bash
-   streamlit run app.py
-   ```
-   It opens in your browser at `http://localhost:8501`. Pick your reading option at the top of the sidebar, upload the claim documents (if applicable), and go.
+### Install and run
 
-## Deploying to Streamlit Community Cloud (like PostBuddy)
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+It opens at `http://localhost:8501`. You also need two system programs:
+- **poppler** (reads PDF pages): Windows - [binaries](https://github.com/oschwartz10612/poppler-windows/releases), add `bin` to PATH; Mac - `brew install poppler`; Linux - `sudo apt install poppler-utils`
+- **tesseract** (only for Offline OCR): Windows - [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki), add to PATH; Mac - `brew install tesseract`; Linux - `sudo apt install tesseract-ocr`
 
-1. Push this folder to a GitHub repo (the included `packages.txt` tells Streamlit Cloud to install `poppler-utils` automatically — you don't need to do anything extra for that).
-2. On [share.streamlit.io](https://share.streamlit.io), point a new app at the repo, main file `app.py`.
-3. Instead of typing your API key into the sidebar every time, add it as a **Streamlit secret**: in the app's settings → Secrets, add whichever provider you're using:
-   ```toml
-   ANTHROPIC_API_KEY = "sk-ant-..."
-   ```
-   and/or
-   ```toml
-   GEMINI_API_KEY = "your-gemini-key"
-   ```
-   The app reads these automatically if the sidebar field is left blank — same mechanism as the local `secrets.toml` file above.
+On Streamlit Community Cloud, `packages.txt` installs poppler automatically: push the repo, point a new app at `app.py` on [share.streamlit.io](https://share.streamlit.io), and add the secret above.
 
 ## How the item matching works
 

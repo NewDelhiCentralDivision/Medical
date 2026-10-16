@@ -72,27 +72,47 @@ def fiscal_year_label(today=None):
 # Sidebar: API key + rate list + city/tier
 # ---------------------------------------------------------------------------
 st.sidebar.title("Setup")
-st.sidebar.subheader("Reading the documents")
-provider = st.sidebar.selectbox(
-    "How should the claim documents be read?",
-    [
-        "Manual entry only - no OCR, no key needed",
-        "Local OCR (offline, free - Tesseract)",
-        "Anthropic (Claude)",
-        "Google (Gemini)",
-    ],
-    index=0,
-    help="The first two options need no API key at all and never send your documents anywhere."
-)
 
 def _get_secret(name):
     """Check st.secrets first (works for local secrets.toml and Streamlit Cloud secrets), then env vars."""
     try:
         if name in st.secrets:
-            return st.secrets[name]
+            return str(st.secrets[name])
     except Exception:
         pass
     return os.environ.get(name, "")
+
+
+def _clean_key(k):
+    """Strip whitespace/quotes - a stray space or quote copied with a key is a common cause of 'key not valid'."""
+    return (k or "").strip().strip('"').strip("'").strip()
+
+
+# The API keys are set ONCE by whoever deploys the tool (Streamlit secrets, a local
+# .streamlit/secrets.toml, or an environment variable). Officers never see or type a key.
+# They are deliberately NOT written into the source code: this repository is public, and
+# Google/Anthropic automatically disable any key they find in a public repo.
+GEMINI_KEY = _clean_key(_get_secret("GEMINI_API_KEY") or _get_secret("GOOGLE_API_KEY"))
+CLAUDE_KEY = _clean_key(_get_secret("ANTHROPIC_API_KEY"))
+
+P_GEMINI = "Google (Gemini)"
+P_CLAUDE = "Anthropic (Claude)"
+P_OCR = "Local OCR (offline, free - Tesseract)"
+P_MANUAL = "Manual entry only - no OCR, no key needed"
+PROVIDER_LABELS = {
+    P_GEMINI: "🤖 Auto-read with AI (Gemini)",
+    P_CLAUDE: "🤖 Auto-read with AI (Claude)",
+    P_OCR: "📝 Offline OCR - raw text only",
+    P_MANUAL: "⌨️ Type everything manually",
+}
+provider_options = ([P_GEMINI] if GEMINI_KEY else []) + ([P_CLAUDE] if CLAUDE_KEY else []) + [P_OCR, P_MANUAL]
+
+st.sidebar.subheader("1 · How to read the documents")
+provider = st.sidebar.radio(
+    "Reading mode", provider_options, index=0, format_func=lambda p: PROVIDER_LABELS[p],
+    label_visibility="collapsed",
+    help="AI reading needs the tool's built-in key. Offline OCR and manual typing need no key and send nothing anywhere.",
+)
 
 api_key = ""
 model_name = ""
@@ -129,88 +149,61 @@ def model_picker(label, models, default, key, help_text):
     return choice
 
 
-if provider == "Manual entry only - no OCR, no key needed":
+if provider == P_MANUAL:
+    st.sidebar.caption("Nothing is read automatically - type the details in sections 2 and 3. All checks work the same.")
+elif provider == P_OCR:
     st.sidebar.caption(
-        "No documents get read automatically. Skip straight to section 2 below and type in the "
-        "claimant details and each billed item yourself - the rate check, flagging, and letter "
-        "generation all work exactly the same either way."
+        "Runs on this machine and sends nothing anywhere. Plain OCR can misread digits in amounts, so it "
+        "only shows the raw text beside the scan - you type the confirmed values yourself. "
+        "Needs the `tesseract` program installed (see README)."
     )
-elif provider == "Local OCR (offline, free - Tesseract)":
-    st.sidebar.caption(
-        "Runs entirely on this machine, sends nothing anywhere, and needs no key. **However, plain "
-        "OCR sometimes misreads digits in amounts** (a real ₹1,000 has been misread as ₹600 in "
-        "testing) - so it only shows you the raw text to read alongside the original scan. It will "
-        "not auto-fill amounts into the claim table for you; you still type those in yourself, just "
-        "with the raw text as a handy reference."
-    )
-    st.sidebar.caption("Requires the `tesseract` program installed on this machine (see README).")
-elif provider == "Anthropic (Claude)":
-    default_key = _get_secret("ANTHROPIC_API_KEY")
-    api_key = st.sidebar.text_input(
-        "Anthropic API key",
-        type="password",
-        help="Get one at console.anthropic.com. Pre-filled automatically if set in secrets.toml or as an environment variable, so you shouldn't need to type it each time.",
-        value=default_key,
-    )
+elif provider == P_CLAUDE:
+    api_key = CLAUDE_KEY
     model_name = model_picker(
         "Model", CLAUDE_MODELS, "claude-sonnet-5-5", key="claude_model",
         help_text="claude-sonnet-5-5 is a good balance of accuracy and cost for reading scanned bills. "
                   "Pick 'Other' to type any model name; docs.claude.com has the up to date list."
     )
 else:
-    default_key = _get_secret("GEMINI_API_KEY") or _get_secret("GOOGLE_API_KEY")
-    api_key = st.sidebar.text_input(
-        "Gemini API key",
-        type="password",
-        help="Get one free at aistudio.google.com/apikey - use the AI Studio key, not a Google Cloud Console key. Pre-filled automatically if set in secrets.toml or as an environment variable.",
-        value=default_key,
-    )
+    api_key = GEMINI_KEY
     model_name = model_picker(
         "Model", GEMINI_MODELS, "gemini-3.8-flash", key="gemini_model",
         help_text="List checked against Google's model pages on 15 Oct 2026. gemini-3.8-flash is the "
-                  "recommended fast model for new projects; gemini-4-argon is the newest and most capable "
-                  "(released 13 Oct 2026); gemini-3.5-flash-lite is the cheapest. 'gemini-flash-latest' is a "
-                  "rolling alias Google keeps pointed at its current fast model. Google retires models "
-                  "regularly - if one ever 404s, pick another here, or choose 'Other' and type the name "
-                  "from https://ai.google.dev/gemini-api/docs/models"
+                  "recommended fast model; gemini-4-argon is the newest and most capable; "
+                  "gemini-3.5-flash-lite is the cheapest. 'gemini-flash-latest' is a rolling alias. "
+                  "If a model ever stops working, pick another, or choose 'Other' and type a name from "
+                  "https://ai.google.dev/gemini-api/docs/models"
     )
 
-# Strip whitespace and stray quote characters - a very common cause of "API key not valid"
-# errors is accidentally copying a leading/trailing space or a quote mark along with the key.
-api_key = api_key.strip().strip('"').strip("'").strip() if api_key else api_key
-
-if provider in ("Anthropic (Claude)", "Google (Gemini)") and not api_key:
+if not GEMINI_KEY and not CLAUDE_KEY:
     st.sidebar.caption(
-        "No key entered yet. To avoid typing it every time, create a file `.streamlit/secrets.toml` "
-        "next to app.py with a line like `ANTHROPIC_API_KEY = \"sk-ant-...\"` (or `GEMINI_API_KEY = \"...\"`) "
-        "and it will load automatically."
+        "ℹ️ AI reading is switched off because no API key has been set up for this tool yet. "
+        "The administrator can enable it once - see the README (\"One-time key setup\")."
     )
 
-if provider in ("Anthropic (Claude)", "Google (Gemini)") and api_key:
-    if st.sidebar.button("✅ Test this key"):
+if api_key:
+    if st.sidebar.button("Check AI connection"):
         try:
             if not model_name:
                 raise ValueError("choose a model first (or type a model name under 'Other')")
-            if provider == "Anthropic (Claude)":
+            if provider == P_CLAUDE:
                 import anthropic
-                client = anthropic.Anthropic(api_key=api_key)
-                client.messages.create(model=model_name, max_tokens=10,
-                                        messages=[{"role": "user", "content": "Say OK"}])
+                anthropic.Anthropic(api_key=api_key).messages.create(
+                    model=model_name, max_tokens=10, messages=[{"role": "user", "content": "Say OK"}])
             else:
                 from google import genai
-                client = genai.Client(api_key=api_key)
-                client.models.generate_content(model=model_name, contents=["Say OK"])
-            st.sidebar.success("Key works.")
+                genai.Client(api_key=api_key).models.generate_content(model=model_name, contents=["Say OK"])
+            st.sidebar.success("AI connection works.")
         except Exception as e:
-            st.sidebar.error(f"Key check failed: {e}")
+            st.sidebar.error(f"Connection check failed: {e}")
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("CGHS Rate List")
-st.sidebar.caption(
-    "Bundled: all three city tiers (X/Y/Z), effective 13.10.2025, 1,998 codes each. "
-    "Upload a replacement JSON/Excel below if CGHS issues a revision."
-)
-custom_master = st.sidebar.file_uploader("Replace rate list (optional)", type=["xlsx", "json"])
+with st.sidebar.expander("⚙️ Advanced: replace CGHS rate list"):
+    st.caption(
+        "Bundled: all three city tiers (X/Y/Z), effective 13.10.2025, 1,998 codes each. "
+        "Upload a replacement JSON/Excel only if CGHS issues a revision."
+    )
+    custom_master = st.file_uploader("Replace rate list (optional)", type=["xlsx", "json"])
 
 @st.cache_data
 def get_master(_uploaded_bytes, _uploaded_name):
@@ -299,7 +292,7 @@ if _rule_problems:
     )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("City / Tier")
+st.sidebar.subheader("2 · City / tier")
 city_input = st.sidebar.text_input("Beneficiary's / treatment city", value="Delhi")
 
 def suggest_tier(city):
@@ -326,6 +319,11 @@ _division_name = (st.session_state.get("office_division") or "").strip()
 st.caption(f"{_division_name + ' — ' if _division_name else ''}decision-support tool. "
            "Every match and amount must be reviewed by the processing officer before a case is sanctioned.")
 
+st.markdown(
+    "**How to use:** &nbsp;① pick how to read the documents (sidebar) &nbsp;→&nbsp; ② upload the bills and click "
+    "*Extract* &nbsp;→&nbsp; ③ check the claimant and item tables &nbsp;→&nbsp; ④ download the memo and checklist."
+)
+
 if "extracted" not in st.session_state:
     st.session_state.extracted = None
 if "line_items" not in st.session_state:
@@ -336,7 +334,7 @@ if "line_items" not in st.session_state:
 # ---------------------------------------------------------------------------
 st.header("1. Upload claim documents")
 
-if provider == "Manual entry only - no OCR, no key needed":
+if provider == P_MANUAL:
     st.info(
         "You've chosen manual entry - no documents need to be uploaded here. "
         "Skip down to **2. Claimant details** and **3. Item-wise CGHS rate check** and type "
@@ -351,7 +349,7 @@ else:
         type=["png", "jpg", "jpeg", "pdf"],
         accept_multiple_files=True
     )
-    button_label = ("📝 Read text (offline, no auto-fill)" if provider == "Local OCR (offline, free - Tesseract)"
+    button_label = ("📝 Read text (offline, no auto-fill)" if provider == P_OCR
                     else "🔍 Extract claim details")
     run_ocr = st.button(button_label, type="primary", disabled=not uploaded_files)
 
@@ -438,7 +436,7 @@ def run_local_ocr(images):
     import pytesseract
     return [pytesseract.image_to_string(im) for im in images]
 
-if provider == "Local OCR (offline, free - Tesseract)" and run_ocr:
+if provider == P_OCR and run_ocr:
     try:
         images = []
         for f in uploaded_files:
@@ -462,9 +460,9 @@ if provider == "Local OCR (offline, free - Tesseract)" and run_ocr:
             "command for your OS."
         )
 
-if provider in ("Anthropic (Claude)", "Google (Gemini)") and run_ocr:
+if provider in (P_CLAUDE, P_GEMINI) and run_ocr:
     if not api_key:
-        st.error(f"Please enter your {provider} API key in the sidebar first.")
+        st.error("AI reading is not set up on this installation (no API key configured). Choose another reading mode in the sidebar.")
     else:
         with st.spinner(f"Reading documents with {provider}..."):
             try:
@@ -472,7 +470,7 @@ if provider in ("Anthropic (Claude)", "Google (Gemini)") and run_ocr:
                 for f in uploaded_files:
                     images.extend(file_to_pil_images(f))
 
-                if provider == "Anthropic (Claude)":
+                if provider == P_CLAUDE:
                     extracted = extract_with_anthropic(images, api_key, model_name)
                 else:
                     extracted = extract_with_gemini(images, api_key, model_name)
@@ -484,15 +482,10 @@ if provider in ("Anthropic (Claude)", "Google (Gemini)") and run_ocr:
                 err_text = str(e)
                 if "API_KEY_INVALID" in err_text or "API key not valid" in err_text or "invalid x-api-key" in err_text.lower():
                     st.error(
-                        f"**{provider} rejected the API key itself** (not a claim-reading problem). "
-                        f"Common causes:\n\n"
-                        + ("- Copied a Google **Cloud Console** API key rather than an **AI Studio** key from "
-                           "[aistudio.google.com/apikey](https://aistudio.google.com/apikey)\n"
-                           if provider == "Google (Gemini)" else
-                           "- Copied a key from the wrong place - it should start with `sk-ant-` from "
-                           "[console.anthropic.com](https://console.anthropic.com)\n")
-                        + "- A stray space, newline, or quote mark got copied along with the key\n"
-                        + "- The key was since deleted/regenerated in your account, so this copy is stale\n\n"
+                        "**The tool's built-in API key was rejected.** Nothing is wrong with your claim documents - "
+                        "please tell the administrator. They need to replace the key in the app's secrets "
+                        "(a Google AI Studio key from aistudio.google.com/apikey, with no spaces or quotes). "
+                        "Meanwhile, switch the reading mode in the sidebar to manual typing and carry on.\n\n"
                         f"Raw error: `{err_text}`"
                     )
                 elif "NOT_FOUND" in err_text or "404" in err_text or "no longer available" in err_text.lower():
@@ -503,7 +496,7 @@ if provider in ("Anthropic (Claude)", "Google (Gemini)") and run_ocr:
                            "(a rolling alias that should always point to a current working model) - or check "
                            "[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models) "
                            "for the current model list."
-                           if provider == "Google (Gemini)" else
+                           if provider == P_GEMINI else
                            "Pick another model in the sidebar (e.g. `claude-sonnet-5-5`) or check "
                            "[docs.claude.com](https://docs.claude.com) for the current model list.")
                         + f"\n\nRaw error: `{err_text}`"
