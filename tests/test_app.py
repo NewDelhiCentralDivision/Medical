@@ -131,3 +131,12 @@ if __name__ == "__main__":
                 fails += 1
                 print("FAIL", name, "-", repr(e))
     sys.exit(1 if fails else 0)
+
+
+def test_connection_check_keeps_client_alive(monkeypatch):
+    """Regression: a chained genai.Client(...).models.generate_content(...) is garbage-collected
+    mid-call and fails with 'client has been closed'. The client must be held in a variable."""
+    import re
+    src = open("app.py").read()
+    assert not re.search(r"genai\.Client\([^)]*\)\.models", src)
+    assert not re.search(r"anthropic\.Anthropic\([^)]*\)\.messages", src)

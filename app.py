@@ -188,11 +188,15 @@ if api_key:
                 raise ValueError("choose a model first (or type a model name under 'Other')")
             if provider == P_CLAUDE:
                 import anthropic
-                anthropic.Anthropic(api_key=api_key).messages.create(
+                # Keep the client in a variable: if it is only a temporary, Python can discard it
+                # mid-call and the request fails with "client has been closed".
+                client = anthropic.Anthropic(api_key=api_key)
+                client.messages.create(
                     model=model_name, max_tokens=10, messages=[{"role": "user", "content": "Say OK"}])
             else:
                 from google import genai
-                genai.Client(api_key=api_key).models.generate_content(model=model_name, contents=["Say OK"])
+                client = genai.Client(api_key=api_key)
+                client.models.generate_content(model=model_name, contents=["Say OK"])
             st.sidebar.success("AI connection works.")
         except Exception as e:
             st.sidebar.error(f"Connection check failed: {e}")
