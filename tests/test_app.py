@@ -45,9 +45,9 @@ def test_app_runs_clean_and_does_not_pay_packaged_tests_twice():
     at = _app(BILL)
     assert not at.exception
     metrics = {m.label: m.value for m in at.metric}
-    assert metrics["Total claimed"] == "₹1,850"
+    assert metrics["Total claimed"] == "₹1,850.00"
     # CBC 300 + KFT 500 (capped) + HbA1c 300 (the repeat, Hb/TLC/Platelet and creatinine are not paid again)
-    assert metrics["Total admissible (as per CGHS rates)"] == "₹1,100"
+    assert metrics["Total admissible (as per CGHS rates)"] == "₹1,100.00"
     sheet = [d.value for d in at.dataframe if "Result" in d.value.columns][0]
     status = dict(zip(sheet["Particulars"].str[:12], sheet["Result"]))
     assert status["Haemoglobin "] == "INCLUDED IN PACKAGE"
@@ -140,3 +140,14 @@ def test_connection_check_keeps_client_alive(monkeypatch):
     src = open("app.py").read()
     assert not re.search(r"genai\.Client\([^)]*\)\.models", src)
     assert not re.search(r"anthropic\.Anthropic\([^)]*\)\.messages", src)
+
+
+def test_amounts_shown_with_exactly_two_decimals():
+    at = _app(BILL)
+    metrics = {m.label: m.value for m in at.metric}
+    assert metrics["Total claimed"] == "₹1,850.00"
+    assert metrics["Total admissible (as per CGHS rates)"] == "₹1,100.00"
+    assert metrics["Difference"] == "₹750.00"
+    import re
+    for m in at.metric:
+        assert not re.search(r"\.\d{3,}", m.value)

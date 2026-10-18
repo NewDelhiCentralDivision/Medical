@@ -606,7 +606,7 @@ edited_df = st.data_editor(
             options=OVERRIDE_CHOICES, default=OVERRIDE_AUTO, required=True,
             help="Auto = apply the billing rules. Count = pay this row even if it looks like a repeat or part "
                  "of a package. Exclude = do not pay this row."),
-        "Claimed (₹)": st.column_config.NumberColumn(min_value=0, format="%.0f"),
+        "Claimed (₹)": st.column_config.NumberColumn(min_value=0, format="%.2f"),
     },
 )
 
@@ -642,7 +642,7 @@ final_items = apply_billing_rules(rows_final, BY_CODE)
 def _result_note(r):
     note = r['rule_note']
     if r['cghs_rate'] is not None and r['claimed_amount'] > r['cghs_rate']:
-        capped = f"Billed ₹{r['claimed_amount']:,} is above the CGHS rate ₹{r['cghs_rate']:,} - restricted to the rate."
+        capped = f"Billed ₹{r['claimed_amount']:,.2f} is above the CGHS rate ₹{r['cghs_rate']:,.2f} - restricted to the rate."
         note = f"{note} {capped}".strip()
     return note
 
@@ -672,7 +672,11 @@ def _row_colour(row):
 
 st.subheader("Calculation sheet")
 if len(sheet):
-    st.dataframe(sheet.style.apply(_row_colour, axis=1), width="stretch", hide_index=True)
+    _money = lambda v: "-" if v is None or pd.isna(v) else f"{float(v):,.2f}"
+    st.dataframe(
+        sheet.style.apply(_row_colour, axis=1).format(
+            {"Claimed (₹)": _money, "CGHS rate (₹)": _money, "Counted (₹)": _money}),
+        width="stretch", hide_index=True)
 else:
     st.caption("Nothing to calculate yet - add at least one billed item above.")
 
@@ -689,10 +693,10 @@ unresolved = [r for r in final_items if r['counted_amount'] is None]
 summary = summarise(final_items)
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Total claimed", f"₹{total_claimed:,.0f}")
-m2.metric("Total admissible (as per CGHS rates)", f"₹{total_admissible:,.0f}")
+m1.metric("Total claimed", f"₹{total_claimed:,.2f}")
+m2.metric("Total admissible (as per CGHS rates)", f"₹{total_admissible:,.2f}")
 diff = total_claimed - total_admissible
-m3.metric("Difference", f"₹{diff:,.0f}", delta=f"-₹{diff:,.0f}" if diff > 0 else None, delta_color="inverse")
+m3.metric("Difference", f"₹{diff:,.2f}", delta=f"-₹{diff:,.2f}" if diff > 0 else None, delta_color="inverse")
 
 if summary['excluded']:
     st.info(
@@ -881,8 +885,8 @@ if st.button("📄 Generate documents", type="primary", disabled=(not name or no
         'sl_no': i + 1,
         'particulars': r['matched_description'] or r['description'],
         'code': r['code'],
-        'claimed': r['claimed_amount'],
-        'admissible': r['counted_amount'] if r['counted_amount'] is not None else 'MANUAL REVIEW',
+        'claimed': f"{float(r['claimed_amount']):.2f}",
+        'admissible': f"{float(r['counted_amount']):.2f}" if r['counted_amount'] is not None else 'MANUAL REVIEW',
         'remark': _remark(r),
     } for i, r in enumerate(final_items)]
 
